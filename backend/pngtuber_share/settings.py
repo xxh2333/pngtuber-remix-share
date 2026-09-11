@@ -153,3 +153,10 @@ NINJA_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(days=1),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 }
+
+# Production settings
+import os
+DEBUG = False
+ALLOWED_HOSTS = ['*']
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-8nk$l8gw$f-k+1pw-x0cu!i4huq_*h5@j2twn7+@x!tty!mf%z')
