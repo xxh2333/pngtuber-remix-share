@@ -90,7 +90,14 @@ function openEdit(work) {
   editForm.tags = work.tags.map(t => t.name)
   editForm.source = work.source
   editForm.allow_remix = work.allow_remix
+  editForm.allow_download = work.allow_download
+  editForm.newFile = null
+  if (fileInput.value) fileInput.value.value = ''
   editVisible.value = true
+}
+
+function onFileChange(e) {
+  editForm.newFile = e.target.files[0] || null
 }
 
 async function saveEdit() {
@@ -102,7 +109,14 @@ async function saveEdit() {
       tags: editForm.tags,
       source: editForm.source,
       allow_remix: editForm.allow_remix,
+      allow_download: editForm.allow_download,
     })
+    // 如果选择了新文件，替换原文件并重新生成预览图
+    if (editForm.newFile) {
+      const fd = new FormData()
+      fd.append('file', editForm.newFile)
+      await worksApi.replaceFile(editForm.id, fd)
+    }
     ElMessage.success('保存成功')
     editVisible.value = false
     loadWorks()
@@ -160,5 +174,10 @@ onMounted(loadWorks)
   margin-top: 8px;
   display: flex;
   gap: 8px;
+}
+.file-hint {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #909399;
 }
 </style>
