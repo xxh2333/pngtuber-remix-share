@@ -1,59 +1,247 @@
-"""PNGTuber Plus .pngRemix / .pngtuber 文件解析与预览合成
+"""PNGTuber Remix .pngRemix / .pngtuber 文件解析与预览合成
 
-二进制格式（v1.4.5 逆向）：
-- 非 ZIP，文件头为二进制头部，含 version / sprites_array 等
-- 内嵌多张 PNG（以标准 PNG 签名开头，IEND 结尾）
-- sprites_array 区段（第一张 PNG 之前）记录每个 sprite 实例的完整属性
+真实文件格式（由 Godot 4.3 源码 core/io/marshalls.cpp 与引擎脚本双向核实）：
+- 文件不是 JSON，而是 Godot 的 FileAccess.store_var(dict, true) 二进制产物：
+  u32 payload 长度 + 一个 Variant(Dictionary)
+- 顶层 dict：version / sprites_array / settings_dict / input_array / image_manager_data
+- 贴图以 PNG 字节包在 PackedByteArray(image_manager_data[i].runtime_texture) 内
 
-节点树（对应源码 spriteObject.tscn / spriteObject.gd）：
-  Node2D(position) → WobbleOrigin → DragOrigin → Sprite2D(position=offset)
-- 子 sprite 被 reparent 到【父节点的 Sprite2D】下（reparent_obj）
-- 父 Sprite2D 的 position 即父 offset，会沿变换链传递给所有后代
-- 因此纹理世界中心 = 沿父链对每个节点（含自身、含 folder）累加 (position + offset)
+trim 语义（关键，来源 Scripts/AutoLoads/LoadMisc.gd L67-80 等）：
+- 导入开 Trim 时，引擎裁掉透明边，并把
+  center_shift = trim.min - (原图尺寸 - 裁剪尺寸) / 2
+  直接【加进部件 offset 与 image_data.offset】，保存的 runtime_texture 就是裁剪后的图。
+- 因此文件里【没有】trim/origin/source_size 字段，Sprite2D 锚点恒为纹理中心；
+  渲染方无需（也无法）再手算 trim，offset 已是最终补偿值。
 
-clip 字段（源码 set_clip_children_mode，Godot CanvasItem.ClipChildrenMode）：
-- 0=禁用；1=CLIP_CHILDREN_ONLY（自身不绘制，裁剪后代）；
-  2=CLIP_CHILDREN_AND_DRAW（自身绘制，后代纹理被裁剪到自身纹理 alpha 区域内）
-- 裁剪对整棵后代子树生效（i15 脸、i18 窄眼为 2）
+节点变换链（来源 Misc/SpriteObject/sprite_object.tscn、sprite_object.gd get_state、
+SpriteObjectClass.gd reparent_obj）：
+  SpriteObject(Node2D: position / scale / rotation)
+    └ Modifier1(z_index，z_as_relative=true → 沿链累加)
+      └ Rotation / Modifier
+        └ Sprite2D(position = offset，flip 用 scale ±1，纹理居中)
+  reparent 时子 SpriteObject 挂到【父节点的 Sprite2D】下，所以：
+  M_节点   = M_父Sprite2D · T(position) · R(rotation) · S(scale)
+  M_贴图   = M_节点 · T(offset) · S(flip_h ? -1 : 1, flip_v ? -1 : 1)
 
-坐标系统：
-- Godot 2D，y 轴向下（与 PIL 一致），不翻转 y 轴
-- 合成时减去半宽半高，把中心坐标转为左上角坐标
+clip（CanvasItem.clip_children_mode，Godot 4.7）：1=仅裁后代；2=裁后代且自身也裁。
+后代绘制被裁到该节点 Sprite2D【实际绘制的帧四边形】（屏幕空间，多帧部件按当前帧尺寸），
+沿父链所有 clip 祖先取交集；多边形顶点须按 TL→TR→BR→BL 绕序，否则填充成自交蝴蝶结。
 
-预览合成策略（idle 常态）：
-- 仅绘制 open_eyes=1（睁眼件/常驻件）且 open_mouth=0（非张嘴说话件）
-- visible=0 的手动隐藏图层跳过
-- 按 z_index 排序（z_as_relative=false，为全局层级）
-- 后代按 clip 祖先的纹理 alpha 做遮罩裁剪
-- 无 image_id 的孤立 PNG 资源（背景件）置于最底层
-- 无 sprite 数据时回退：所有资源按文件顺序合成
+idle 预览过滤：
+- visible=false 跳过
+- should_blink=true 且 open_eyes=false 的是【闭眼替件】，跳过
+- should_talk=true 且 open_mouth=true 的是【张嘴替件】，跳过
+- 文件夹节点不绘制，但其 transform / z 仍在链路上
+- 没有任何 sprite 引用的孤立图片垫最底层（PSD 导入等历史数据）
+
+坐标：Godot 2D y 向下，与 PIL 一致，不翻转。
 """
 import io
-import re
+import math
 import struct
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 PNG_SIG = b'\x89PNG\r\n\x1a\n'
-IEND = b'IEND\xaeB\x60\x82'
+IEND = b'IEND\xaeB`\x82'
+
+# ---- Godot Variant 类型码（core/variant/variant.h）----
+T_NIL, T_BOOL, T_INT, T_FLOAT, T_STR, T_VEC2, T_VEC2I, T_RECT2, T_RECT2I = range(9)
+T_VEC3, T_VEC3I, T_TR2D, T_VEC4, T_VEC4I, T_PLANE, T_QUAT, T_AABB = range(9, 17)
+T_BASIS, T_TR3D, T_PROJ, T_COLOR, T_SNAME, T_NPATH, T_RID, T_OBJECT, T_CALL, T_SIG = range(17, 27)
+T_DICT, T_ARRAY = 27, 28
+PB_BA, PB_I32, PB_I64, PB_F32, PB_F64, PB_STR, PB_V2, PB_V3, PB_COL, PB_V4 = range(29, 39)
+
+_FLAG_64 = 1 << 16
+_TYPED_MASK = 0b11 << 16
+_TYPED_BUILTIN = 0b01 << 16
+_TYPED_CLASS = 0b10 << 16
+_TYPED_SCRIPT = 0b11 << 16
 
 
-def _read_cstr(tail: bytes, tpos: int) -> str:
-    """类型码 04 后的字符串：04 00 00 00 + len(4) + utf8/gbk 字节"""
-    slen = int.from_bytes(tail[tpos + 4:tpos + 8], 'little')
-    if not (0 < slen < 80):
-        return ""
-    raw = tail[tpos + 8:tpos + 8 + slen]
-    for enc in ('utf-8', 'gbk'):
-        try:
-            return raw.decode(enc)
-        except Exception:
-            pass
-    return ""
+class _Reader:
+    """Godot 二进制 Variant 解码器（store_var(allow_objects=True) 读路径所需子集）。"""
+
+    __slots__ = ('b', 'i')
+
+    def __init__(self, b: bytes):
+        self.b = b
+        self.i = 0
+
+    def u32(self):
+        v = struct.unpack_from('<I', self.b, self.i)[0]
+        self.i += 4
+        return v
+
+    def i32(self):
+        v = struct.unpack_from('<i', self.b, self.i)[0]
+        self.i += 4
+        return v
+
+    def u64(self):
+        v = struct.unpack_from('<Q', self.b, self.i)[0]
+        self.i += 8
+        return v
+
+    def f32(self):
+        v = struct.unpack_from('<f', self.b, self.i)[0]
+        self.i += 4
+        return v
+
+    def f64(self):
+        v = struct.unpack_from('<d', self.b, self.i)[0]
+        self.i += 8
+        return v
+
+    def string(self):
+        n = self.u32()
+        pad = (4 - n % 4) % 4
+        raw = self.b[self.i:self.i + n]
+        self.i += n + pad
+        return raw.rstrip(b'\x00').decode('utf-8', 'replace')
+
+    def var(self, depth=0):
+        if depth > 32:
+            raise ValueError('Variant 嵌套过深')
+        header = self.u32()
+        t = header & 0xFF
+        wide = bool(header & _FLAG_64)
+
+        if t == T_NIL:
+            return None
+        if t == T_BOOL:
+            return bool(self.u32())
+        if t == T_INT:
+            return self.u64() if wide else self.i32()
+        if t == T_FLOAT:
+            return self.f64() if wide else self.f32()
+        if t in (T_STR, T_SNAME):
+            return self.string()
+        if t == T_VEC2:
+            return (self.f64(), self.f64()) if wide else (self.f32(), self.f32())
+        if t == T_VEC2I:
+            return (self.i32(), self.i32())
+        if t == T_VEC3:
+            return ((self.f64(), self.f64(), self.f64()) if wide
+                    else (self.f32(), self.f32(), self.f32()))
+        if t in (T_VEC4, T_QUAT, T_PLANE):
+            return tuple(self.f64() if wide else self.f32() for _ in range(4))
+        if t == T_COLOR:
+            return tuple(self.f32() for _ in range(4))
+        if t in (T_RECT2, T_TR2D, T_AABB):
+            return tuple(self.f64() if wide else self.f32() for _ in range(4 if t == T_RECT2 else (2 if t == T_AABB else 6)))
+        if t == T_NPATH:
+            n = self.u32() & 0x7FFFFFFF
+            sub = self.u32()
+            flags = self.u32()
+            names = [self.string() for _ in range(n + sub)]
+            return ('NodePath', names, bool(flags & 1))
+        if t == T_RID:
+            return ('RID', self.u64())
+        if t == T_OBJECT:
+            if header & _FLAG_64:  # OBJECT_AS_ID
+                return ('ObjID', self.u64())
+            cls = self.string()
+            if not cls:
+                return None
+            count = self.u32()
+            props = {}
+            for _ in range(count):
+                k = self.string()
+                props[k] = self.var(depth + 1)
+            return ('Obj', cls, props)
+        if t == T_CALL:
+            return ('Callable',)
+        if t == T_SIG:
+            return ('Signal', self.string(), self.u64())
+        if t == T_DICT:
+            count = self.u32() & 0x7FFFFFFF
+            out = {}
+            for _ in range(count):
+                k = self.var(depth + 1)
+                out[str(k)] = self.var(depth + 1)
+            return out
+        if t == T_ARRAY:
+            mask = header & _TYPED_MASK
+            if mask == _TYPED_BUILTIN:
+                self.u32()
+            elif mask in (_TYPED_CLASS, _TYPED_SCRIPT):
+                self.string()
+                if mask == _TYPED_SCRIPT:
+                    self.var(depth + 1)
+            count = self.u32() & 0x7FFFFFFF
+            return [self.var(depth + 1) for _ in range(count)]
+        if t == PB_BA:
+            n = self.u32()
+            raw = bytes(self.b[self.i:self.i + n])
+            self.i += n + (4 - n % 4) % 4
+            return ('bytes', raw)
+        if t == PB_I32:
+            n = self.u32()
+            v = [self.i32() for _ in range(n)]
+            return v
+        if t == PB_I64:
+            n = self.u32()
+            return [self.u64() for _ in range(n)]
+        if t == PB_F32:
+            n = self.u32()
+            return [self.f32() for _ in range(n)]
+        if t == PB_F64:
+            n = self.u32()
+            return [self.f64() for _ in range(n)]
+        if t == PB_STR:
+            n = self.u32()
+            return [self.string() for _ in range(n)]
+        if t in (PB_V2, PB_V3, PB_COL, PB_V4):
+            n = self.u32()
+            comp = {PB_V2: 2, PB_V3: 3, PB_COL: 4, PB_V4: 4}[t]
+            rd = self.f64 if (wide and t != PB_COL) else self.f32
+            return [tuple(rd() for _ in range(comp)) for _ in range(n)]
+        raise ValueError(f'不支持的 Variant 类型 {t} @offset {self.i - 4}')
+
+
+# ---- 2D 仿射（3x3，对点用列向量；Godot 变换左乘）----
+
+def _mat_identity():
+    return ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+def _mat_mul(a, b):
+    return tuple(tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3))
+                 for i in range(3))
+
+
+def _mat_translate(x, y):
+    return ((1.0, 0.0, x), (0.0, 1.0, y), (0.0, 0.0, 1.0))
+
+
+def _mat_rotate(rad):
+    c, s = math.cos(rad), math.sin(rad)
+    return ((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0))
+
+
+def _mat_scale(sx, sy):
+    return ((sx, 0.0, 0.0), (0.0, sy, 0.0), (0.0, 0.0, 1.0))
+
+
+def _mat_apply(m, p):
+    x, y = p
+    return (m[0][0] * x + m[0][1] * y + m[0][2],
+            m[1][0] * x + m[1][1] * y + m[1][2])
+
+
+def _mat_invert(m):
+    (a, b, c), (e, f, g) = m[0], m[1]
+    det = a * f - b * e
+    if abs(det) < 1e-12:
+        return _mat_identity()
+    return ((f / det, -b / det, (b * g - c * f) / det),
+            (-e / det, a / det, (c * e - a * g) / det),
+            (0.0, 0.0, 1.0))
 
 
 def _find_pngs(data: bytes):
-    """返回 [(start, end), ...] 所有内嵌 PNG 的起止位置"""
+    """扫描内嵌 PNG（兜底路径使用），返回 [(start, end_exclusive-ish), ...]。"""
     spans = []
     s = 0
     while True:
@@ -68,286 +256,238 @@ def _find_pngs(data: bytes):
     return spans
 
 
-def _iter_fields(blk: bytes, marker: int):
-    """枚举 Godot 二进制风格字段。
-
-    结构：marker(4) + name_len(4) + name(\0 填充到 4 对齐) + type(4) + value...
-    产出 (name, type, value_start)
-    """
-    tag = bytes([marker]) + b'\x00\x00\x00'
-    i = 0
-    while True:
-        m = blk.find(tag, i)
-        if m < 0:
-            return
-        i = m + 4
-        name_len = int.from_bytes(blk[m + 4:m + 8], 'little')
-        if not (0 < name_len < 40):
-            continue
-        try:
-            name = blk[m + 8:m + 8 + name_len].rstrip(b'\x00').decode('ascii')
-        except Exception:
-            continue
-        if not name or not all(c.isalnum() or c == '_' for c in name):
-            continue
-        name_total = (name_len + 3) & ~3
-        yield name, m + 8 + name_total
-
-
-def _read_field(blk: bytes, marker: int, want: str, default=None):
-    """读取指定字段的值（按 marker 类型解析）。"""
-    for name, vp in _iter_fields(blk, marker):
-        if name != want or vp + 4 > len(blk):
-            continue
-        t = int.from_bytes(blk[vp:vp + 4], 'little')
-        if marker == 0x15:
-            if t == 1 and vp + 8 <= len(blk):  # bool
-                return int.from_bytes(blk[vp + 4:vp + 8], 'little')
-            if t == 2 and vp + 8 <= len(blk):  # int
-                return struct.unpack('<i', blk[vp + 4:vp + 8])[0]
-            if t == 3 and vp + 8 <= len(blk):  # float
-                return round(struct.unpack('<f', blk[vp + 4:vp + 8])[0], 3)
-            if t == 5 and vp + 12 <= len(blk):  # Vector2
-                return (round(struct.unpack('<f', blk[vp + 4:vp + 8])[0], 3),
-                        round(struct.unpack('<f', blk[vp + 8:vp + 12])[0], 3))
-        else:  # marker == 0x04：ID / 字符串等
-            if t in (2, 0x10002, 0x10003) and vp + 8 <= len(blk):  # int / ID
-                return struct.unpack('<i', blk[vp + 4:vp + 8])[0]
-            if t == 1 and vp + 8 <= len(blk):  # bool
-                return int.from_bytes(blk[vp + 4:vp + 8], 'little')
-    return default
+def _decode_png(raw: bytes):
+    img = Image.open(io.BytesIO(raw))
+    img.load()
+    return img.convert('RGBA')
 
 
 def parse_pngremix(data: bytes):
-    """解析 pngRemix 文件。
+    """完整解析 .pngRemix。
 
-    返回 (resources, sprites)：
-    - resources: [{'img','x','y','hash','name'}]
-    - sprites:   [{'idx','id','parent','z','hash','oe','om','visible',
-                   'pos':(x,y) 本地节点坐标, 'off':(x,y) 纹理绘制偏移,
-                   'world':(wx,wy) 世界纹理中心坐标}]
+    返回 {'images': {id: {'img','name','offset'}}, 'sprites': [sprite, ...]}
+    sprite 字段：sid/parent/image/folder/pos/off/rot/scale/z/clip/visible/
+                open_eyes/open_mouth/blink/talk/flip_h/flip_v/hframes/vframes/order
     """
-    spans = _find_pngs(data)
-    if not spans:
-        raise ValueError("文件中未找到内嵌 PNG 图片")
+    payload_len = struct.unpack_from('<I', data, 0)[0]
+    if not (4 <= payload_len <= len(data) - 4 + 16):
+        raise ValueError('不是合法的 pngRemix 文件（payload 长度异常）')
+    r = _Reader(data)
+    r.u32()
+    save = r.var()
+    if not isinstance(save, dict) or 'sprites_array' not in save:
+        raise ValueError('pngRemix 顶层结构缺少 sprites_array')
 
-    resources = []
-    for ri, (st, en) in enumerate(spans):
-        img = Image.open(io.BytesIO(data[st:en])).convert('RGBA')
-
-        # offset / image_name：PNG 前 300 字节（元数据紧邻 PNG）
-        meta = data[max(0, st - 300):st]
-        ox = oy = 0.0
-        op = meta.rfind(b'offset')
-        if op >= 0:
-            ox = struct.unpack('<f', meta[op + 12:op + 16])[0]
-            oy = struct.unpack('<f', meta[op + 16:op + 20])[0]
-        name = ""
-        npos = meta.rfind(b'image_name')
-        if npos >= 0:
-            tail = meta[npos + 10:npos + 10 + 200]
-            tpos = tail.find(b'\x04\x00\x00\x00')
-            if tpos >= 0:
-                name = _read_cstr(tail, tpos)
-
-        # 资源 id 哈希：窗口从上一张 PNG 起点开始（id 字段在元数据尾部）
-        win_start = spans[ri - 1][0] if ri > 0 else max(0, st - 400)
-        win = data[win_start:st]
-        h = None
-        idm = win.rfind(b'\x69\x64\x00\x00')  # "id\0\0"
-        if idm >= 0:
-            cand = win[idm + 8:idm + 12]
-            if cand != b'\x00\x00\x00\x00':
-                h = cand.hex()
-
-        resources.append({'img': img, 'x': ox, 'y': oy, 'hash': h, 'name': name})
-
-    # sprites_array 区段（第一张 PNG 之前）
-    pos = data.find(b'sprites_array')
-    if pos == -1:
-        return resources, []
-    sr = data[pos:spans[0][0]]
-    z_pos = [m.start() for m in re.finditer(re.escape(b'z_index'), sr)]
+    images = {}
+    for im in save.get('image_manager_data', []):
+        if not isinstance(im, dict):
+            continue
+        rt = im.get('runtime_texture')
+        raw = rt[1] if isinstance(rt, tuple) and rt and rt[0] == 'bytes' else b''
+        if not raw:
+            rawimg = im.get('image_data')
+            raw = rawimg[1] if isinstance(rawimg, tuple) and rawimg and rawimg[0] == 'bytes' else b''
+        if not raw:
+            continue
+        off = im.get('offset', (0.0, 0.0)) or (0.0, 0.0)
+        try:
+            images[int(im['id'])] = {
+                'img': _decode_png(raw),
+                'name': str(im.get('image_name', '')),
+                'offset': (float(off[0]), float(off[1])),
+            }
+        except Exception:
+            continue
 
     sprites = []
-    for i, zp in enumerate(z_pos):
-        # block 从上一个字段名起点(zp-8) 到下一个 block 字段名起点
-        blk_end = z_pos[i + 1] - 8 if i + 1 < len(z_pos) else len(sr)
-        blk = sr[zp - 8:blk_end]
+    for order, sp in enumerate(save.get('sprites_array', [])):
+        if not isinstance(sp, dict):
+            continue
+        states = sp.get('states') or []
+        st = states[0] if states and isinstance(states[0], dict) else {}
 
-        z = _read_field(blk, 0x15, 'z_index', 0) or 0
-        position = _read_field(blk, 0x15, 'position') or (0.0, 0.0)
-        offset = _read_field(blk, 0x15, 'offset') or (0.0, 0.0)
-        oe = _read_field(blk, 0x15, 'open_eyes', 1)
-        om = _read_field(blk, 0x15, 'open_mouth', 0)
-        visible = _read_field(blk, 0x15, 'visible', 1)
-        clip = _read_field(blk, 0x15, 'clip', 0) or 0
+        def g(key, default):
+            return st.get(key, default)
 
-        sprite_id = _read_field(blk, 0x04, 'sprite_id')
-        parent_id = _read_field(blk, 0x04, 'parent_id')
-        image_id = _read_field(blk, 0x04, 'image_id')
-
-        h = None
-        if image_id:  # 0 / None 表示无图片（文件夹节点）
-            h = struct.pack('<i', image_id).hex()
-
+        pos = g('position', (0.0, 0.0)) or (0.0, 0.0)
+        off = g('offset', (0.0, 0.0)) or (0.0, 0.0)
+        scale = g('scale', (1.0, 1.0)) or (1.0, 1.0)
+        sid_raw = sp.get('sprite_id')
+        pid_raw = sp.get('parent_id')
         sprites.append({
-            'idx': i,
-            'id': sprite_id,
-            'parent': parent_id,
-            'z': float(z),
-            'hash': h,
-            'oe': int(oe) if oe is not None else 1,
-            'om': int(om) if om is not None else 0,
-            'visible': int(visible) if visible is not None else 1,
-            'clip': int(clip),
-            'pos': (float(position[0]), float(position[1])),
-            'off': (float(offset[0]), float(offset[1])),
+            'order': order,
+            'sid': int(sid_raw) if sid_raw is not None else None,
+            'parent': int(pid_raw) if pid_raw is not None else 0,
+            'image': int(sp.get('image_id') or 0),
+            'folder': bool(g('folder', False)),
+            'pos': (float(pos[0]), float(pos[1])),
+            'off': (float(off[0]), float(off[1])),
+            'rot': float(g('rotation', 0.0) or 0.0),
+            'scale': (float(scale[0]), float(scale[1])),
+            'z': int(g('z_index', 0) or 0),
+            'clip': int(g('clip', 0) or 0),
+            'visible': bool(g('visible', True)),
+            'open_eyes': bool(g('open_eyes', True)),
+            'open_mouth': bool(g('open_mouth', False)),
+            'blink': bool(g('should_blink', False)),
+            'talk': bool(g('should_talk', False)),
+            'flip_h': bool(g('flip_sprite_h', False)),
+            'flip_v': bool(g('flip_sprite_v', False)),
+            'hframes': max(1, int(g('hframes', 1) or 1)),
+            'vframes': max(1, int(g('vframes', 1) or 1)),
         })
 
-    # 世界坐标：子节点挂在父节点的 Sprite2D（其 position = 父 offset）下，
-    # 故纹理世界中心 = 沿父链对每个节点（含自身、含 folder/root）累加 (pos + off)
-    by_id = {s['id']: s for s in sprites if s['id'] is not None}
+    return {'images': images, 'sprites': sprites}
+
+
+def _build_transforms(model):
+    """沿场景树挂仿射矩阵、全局 z、clip 祖先链；返回可见待绘图层列表。"""
+    sprites = model['sprites']
+    images = model['images']
+    by_id = {s['sid']: s for s in sprites if s['sid'] is not None}
+    children = {}
     for s in sprites:
-        ax = ay = 0.0
-        clips = []
-        seen = set()
-        cur = s
-        while cur and cur['id'] is not None and cur['id'] not in seen:
-            seen.add(cur['id'])
-            ax += cur['pos'][0] + cur['off'][0]
-            ay += cur['pos'][1] + cur['off'][1]
-            pid = cur['parent']
-            cur = by_id.get(pid) if pid not in (None, -1) else None
-            # clip 祖先：从父级开始向上收集（自身不裁剪自身）
-            if cur is not None and cur['clip']:
-                clips.append(cur['id'])
-        s['world'] = (ax, ay)
-        s['clip_ancestors'] = clips
+        children.setdefault(s['parent'] if s['parent'] in by_id else 0, []).append(s)
+    for v in children.values():
+        v.sort(key=lambda s: s['order'])
 
-    return resources, sprites
+    dfs = [0]
 
+    def walk(s, m_parent, gz, clip_chain):
+        px, py = s['pos']
+        sx, sy = s['scale']
+        m_node = _mat_mul(m_parent,
+                          _mat_mul(_mat_translate(px, py),
+                                   _mat_mul(_mat_rotate(s['rot']),
+                                            _mat_scale(sx, sy))))
+        m_img = _mat_mul(
+            m_node,
+            _mat_mul(_mat_translate(*s['off']),
+                     _mat_scale(-1.0 if s['flip_h'] else 1.0,
+                                -1.0 if s['flip_v'] else 1.0)))
+        s['m_node'] = m_node
+        s['m_img'] = m_img
+        s['gz'] = gz + s['z']
+        s['clips'] = clip_chain
+        s['dfs'] = dfs[0]
+        dfs[0] += 1
+        my_chain = clip_chain + ([s] if s['clip'] in (1, 2) else [])
+        for k in children.get(s['sid'], []):
+            walk(k, m_img, s['gz'], my_chain)
 
-def _center_to_topleft(cx: float, cy: float, img: Image.Image) -> tuple[float, float]:
-    """世界中心坐标（Godot y-down）→ PIL 左上角坐标"""
-    return cx - img.width / 2, cy - img.height / 2
+    for root in children.get(0, []):
+        walk(root, _mat_identity(), 0, [])
+
+    layers = []
+    for s in sprites:
+        if 'm_img' not in s:
+            continue
+        if s['folder'] or not s['image'] or s['image'] not in images:
+            continue
+        if not s['visible']:
+            continue
+        if s['blink'] and not s['open_eyes']:
+            continue
+        if s['talk'] and s['open_mouth']:
+            continue
+        layers.append(s)
+    return layers
 
 
 def render_pngremix_preview(data: bytes, thumb_w: int = 300) -> Image.Image:
-    """合成 pngRemix 模型的 idle 状态预览图，返回缩放后的 PIL Image。
+    """合成 pngRemix 模型 idle 状态预览图，返回裁剪透明边并缩放到 thumb_w 的 RGBA 图。"""
+    model = parse_pngremix(data)
+    images = model['images']
+    if not images:
+        raise ValueError('文件中未解析出内嵌 PNG 图片')
 
-    失败时回退：返回第一张内嵌 PNG。
-    """
-    resources, sprites = parse_pngremix(data)
-    by_hash = {r['hash']: r for r in resources if r['hash']}
-    by_id = {s['id']: s for s in sprites if s['id'] is not None}
+    layers = _build_transforms(model)
 
-    layers = []
+    # 孤立图片（没有任何 sprite 引用）垫最底层，用 image_data.offset 定位
+    referenced = {s['image'] for s in model['sprites'] if s['image']}
+    orphans = []
+    for iid, im in images.items():
+        if iid in referenced:
+            continue
+        w, h = im['img'].size
+        ox, oy = im['offset']
+        orphans.append({
+            'm_img': _mat_translate(ox, oy), 'gz': -1 << 30, 'dfs': -iid,
+            'clips': [], 'image': iid, 'hframes': 1, 'vframes': 1,
+            '_corners': [(ox - w / 2, oy - h / 2), (ox + w / 2, oy - h / 2),
+                         (ox - w / 2, oy + h / 2), (ox + w / 2, oy + h / 2)],
+        })
 
-    # 构建渲染顺序：Godot z_as_relative=true，按树遍历排序
-    # 每个父节点内按 z_index 排序子节点，整棵子树作为一组渲染
-    children_by_parent = {}
-    for sp in sprites:
-        pid = sp['parent']
-        children_by_parent.setdefault(pid, []).append(sp)
+    def layer_image(s):
+        iid = s['image']
+        src = images[iid]['img']
+        if s['hframes'] > 1 or s['vframes'] > 1:
+            fw, fh = src.width // s['hframes'], src.height // s['vframes']
+            src = src.crop((0, 0, fw, fh))  # idle 取第 0 帧
+        return src
 
-    draw_order = []
+    # 世界坐标包围盒
+    def corners(s):
+        if '_corners' in s:
+            return s['_corners']
+        src = layer_image(s)
+        hw, hh = src.width / 2, src.height / 2
+        return [_mat_apply(s['m_img'], (x, y))
+                for x in (-hw, hw) for y in (-hh, hh)]
 
-    def visit_tree(sid, depth=0):
-        """深度优先遍历，子节点按 z_index 排序"""
-        if sid is None:
-            return
-        sp = by_id.get(sid)
-        if sp is None:
-            return
-        # 跳过隐藏/闭眼/张嘴件
-        if sp['hash'] and sp['hash'] in by_hash:
-            if sp['oe'] != 0 and sp['om'] != 1 and sp['visible'] != 0:
-                if sp['clip'] != 1:
-                    draw_order.append(sp)
-        # 递归子节点（按 z_index 排序）
-        kids = children_by_parent.get(sid, [])
-        for kid in sorted(kids, key=lambda s: s['z']):
-            visit_tree(kid['id'], depth + 1)
+    everything = orphans + layers
+    box = [c for s in everything for c in corners(s)]
+    if not box:
+        return next(iter(images.values()))['img']
+    min_x = min(c[0] for c in box)
+    min_y = min(c[1] for c in box)
+    max_x = max(c[0] for c in box)
+    max_y = max(c[1] for c in box)
+    W = int(math.ceil(max_x - min_x)) + 2
+    H = int(math.ceil(max_y - min_y)) + 2
+    to_canvas = _mat_translate(-min_x + 1, -min_y + 1)
 
-    # 从 root 的子节点开始
-    root_kids = children_by_parent.get(None, [])
-    for kid in sorted(root_kids, key=lambda s: s['z']):
-        visit_tree(kid['id'])
+    canvas = Image.new('RGBA', (W, H), (0, 0, 0, 0))
+    for s in sorted(everything, key=lambda x: (x['gz'], x['dfs'])):
+        src = layer_image(s)
+        w, h = src.size
+        # 输出像素 (ox,oy) → 源像素：A^-1，A = to_canvas · M_img · T(-w/2,-h/2)
+        a = _mat_mul(to_canvas,
+                     _mat_mul(s['m_img'], _mat_translate(-w / 2, -h / 2)))
+        ai = _mat_invert(a)
+        layer = src.transform(
+            (W, H), Image.Transform.AFFINE,
+            (ai[0][0], ai[0][1], ai[0][2], ai[1][0], ai[1][1], ai[1][2]),
+            resample=Image.BICUBIC, fillcolor=(0, 0, 0, 0))
+        if s['clips']:
+            # 每个 clip 祖先单独成遮罩后相乘（多个 clip 祖先 → 取交集，与 Godot
+            # clip_children 沿父链逐层裁剪一致）；无嵌套时只有一个祖先。
+            mask = Image.new('L', (W, H), 255)
+            for anc in s['clips']:
+                aim = images.get(anc['image'])
+                if aim is None:
+                    continue
+                # clip 矩形 = 该 Sprite2D 实际绘制的帧四边形（多帧部件按帧尺寸）
+                aw0, ah0 = aim['img'].size
+                aw = aw0 // max(1, anc['hframes'])
+                ah = ah0 // max(1, anc['vframes'])
+                hw, hh = aw / 2, ah / 2
+                # 顶点必须按 TL→TR→BR→BL 绕序，否则 ImageDraw 填充会变成
+                # 自交的蝴蝶结（两对三角形），误挖眼睛中部。
+                local = ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))
+                am = _mat_mul(to_canvas, anc['m_img'])
+                one = Image.new('L', (W, H), 0)
+                ImageDraw.Draw(one).polygon(
+                    [_mat_apply(am, p) for p in local], fill=255)
+                mask = ImageChops.multiply(mask, one)
+            layer.putalpha(ImageChops.multiply(layer.getchannel('A'), mask))
+        canvas.alpha_composite(layer)
 
-    # 按树遍历顺序构建图层
-    for sp in draw_order:
-        r = by_hash[sp['hash']]
-        tx, ty = _center_to_topleft(sp['world'][0], sp['world'][1], r['img'])
-        clips = [by_id[cid] for cid in sp.get('clip_ancestors', [])
-                 if cid in by_id and by_id[cid]['hash'] in by_hash]
-        layers.append({'img': r['img'], 'x': tx, 'y': ty,
-                       'z': 0.0, 'idx': sp['idx'], 'clips': clips})
-
-    # 无 image_id 的孤立资源（背景件）置于最底层
-    for ri, r in enumerate(resources):
-        if not r['hash']:
-            tx, ty = _center_to_topleft(r['x'], r['y'], r['img'])
-            layers.insert(0, {'img': r['img'], 'x': tx, 'y': ty,
-                              'z': -999.0, 'idx': -1 - ri})
-
-    # 兜底：无 sprite 数据时用所有资源
-    if not layers:
-        for j, r in enumerate(resources):
-            tx, ty = _center_to_topleft(r['x'], r['y'], r['img'])
-            layers.append({'img': r['img'], 'x': tx, 'y': ty,
-                           'z': 0.0, 'idx': j})
-
-    if not layers:
-        return resources[0]['img'] if resources else Image.new('RGBA', (1, 1))
-
-    # 层已按树遍历顺序排列（背景件已 insert 到最前）
-
-    coords = [(l['x'], l['y'],
-               l['x'] + l['img'].width, l['y'] + l['img'].height)
-              for l in layers]
-    min_x = min(c[0] for c in coords)
-    min_y = min(c[1] for c in coords)
-    max_x = max(c[2] for c in coords)
-    max_y = max(c[3] for c in coords)
-    w = int(max_x - min_x) + 1
-    h = int(max_y - min_y) + 1
-
-    canvas = Image.new('RGBA', (w, h), (0, 0, 0, 0))
-    for l in layers:
-        img = l['img']
-        clip_ancs = l.get('clips')
-        if clip_ancs:
-            # clip 祖先裁剪：Godot set_clip_children_mode 裁剪到祖先纹理 rect
-            img = img.copy()
-            lx, ly = l['x'] - min_x, l['y'] - min_y
-            mask = None
-            for a in clip_ancs:
-                ra = by_hash[a['hash']]
-                ax0 = a['world'][0] - ra['img'].width / 2 - min_x
-                ay0 = a['world'][1] - ra['img'].height / 2 - min_y
-                # 矩形裁剪（Godot clip = CanvasItem.get_rect()）
-                m = Image.new('L', (img.width, img.height), 0)
-                from PIL import ImageDraw
-                draw = ImageDraw.Draw(m)
-                rx0 = int(round(ax0 - lx))
-                ry0 = int(round(ay0 - ly))
-                draw.rectangle([rx0, ry0,
-                                rx0 + ra['img'].width - 1,
-                                ry0 + ra['img'].height - 1], fill=255)
-                mask = m if mask is None else ImageChops.multiply(mask, m)
-            img.putalpha(ImageChops.multiply(img.getchannel('A'), mask))
-        canvas.alpha_composite(img,
-                               (int(round(l['x'] - min_x)),
-                                int(round(l['y'] - min_y))))
-
-    # 裁剪透明边距，只保留有内容的区域
     bbox = canvas.getbbox()
     if bbox:
         canvas = canvas.crop(bbox)
-
-    w, h = canvas.size
-    if w > thumb_w:
-        ratio = thumb_w / w
-        canvas = canvas.resize((thumb_w, max(1, int(h * ratio))), Image.LANCZOS)
+    if canvas.width > thumb_w:
+        canvas = canvas.resize(
+            (thumb_w, max(1, round(canvas.height * thumb_w / canvas.width))),
+            Image.LANCZOS)
     return canvas

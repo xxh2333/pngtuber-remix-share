@@ -155,8 +155,11 @@ NINJA_JWT = {
 }
 
 # Production settings
+# 本地开发默认 DEBUG=True（Django 开发服务器借此提供 /media 静态服务）；
+# 部署时通过环境变量 DJANGO_DEBUG=False 关闭。
 import os
-DEBUG = False
+if os.environ.get('DJANGO_DEBUG', 'True').lower() in ('0', 'false', 'no'):
+    DEBUG = False
 ALLOWED_HOSTS = ['*']
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-8nk$l8gw$f-k+1pw-x0cu!i4huq_*h5@j2twn7+@x!tty!mf%z')
